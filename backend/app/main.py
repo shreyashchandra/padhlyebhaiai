@@ -8,10 +8,38 @@ import cloudinary
 import cloudinary.uploader
 import fitz
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 from tavily import TavilyClient
+
+from .auth import (
+    create_access_token,
+    get_current_user,
+    hash_password,
+    verify_password,
+)
+from .billing import (
+    ensure_credit_available,
+    estimate_openai_cost,
+    get_credit_summary,
+    pdf_parse_estimate_usd,
+    read_usage_field,
+    record_usage,
+    vision_parse_estimate_usd,
+    web_research_estimate_usd,
+)
+from .db import Base, engine, get_db
+from .models import User
+from .schemas import (
+    AuthResponse,
+    BillingSummaryOut,
+    MeResponse,
+    UserLogin,
+    UserRegister,
+)
 
 load_dotenv()
 
@@ -27,6 +55,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.on_event("startup")
+def on_startup():
+    Base.metadata.create_all(bind=engine)
+
+
 openai_api_key = os.getenv("OPENAI_API_KEY")
 if not openai_api_key:
     raise RuntimeError("OPENAI_API_KEY is missing in .env")
@@ -34,7 +68,7 @@ if not openai_api_key:
 client = OpenAI(api_key=openai_api_key)
 
 vision_model = os.getenv("OPENAI_VISION_MODEL", "gpt-4o")
-planner_model = os.getenv("OPENAI_PLANNER_MODEL", "gpt-4.1")
+planner_model = os.getenv("OPENAI_PLANNER_MODEL", "gpt-4.1-mini")
 
 cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME")
 cloudinary_api_key = os.getenv("CLOUDINARY_API_KEY")
@@ -54,6 +88,76 @@ tavily_client = TavilyClient(api_key=tavily_api_key) if tavily_api_key else None
 @app.get("/api/health")
 def health_check():
     return {"status": "ok"}
+
+
+@app.post("/api/auth/register", response_model=AuthResponse, status_code=201)
+def register(payload: UserRegister, db: Session = Depends(get_db)):
+    existing_user = db.scalar(
+        select(User).where(User.email == payload.email.lower())
+    )
+
+    if existing_user:
+        raise HTTPException(status_code=409, detail="Account already exists.")
+
+    user = User(
+        email=payload.email.lower(),
+        hashed_password=hash_password(payload.password),
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    access_token = create_access_token(user.id)
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": user,
+        "billing": get_credit_summary(db, user.id),
+    }
+
+
+@app.post("/api/auth/login", response_model=AuthResponse)
+def login(payload: UserLogin, db: Session = Depends(get_db)):
+    user = db.scalar(select(User).where(User.email == payload.email.lower()))
+
+    if not user or not verify_password(payload.password, user.hashed_password):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password.",
+        )
+
+    access_token = create_access_token(user.id)
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": user,
+        "billing": get_credit_summary(db, user.id),
+    }
+
+
+@app.get("/api/auth/me", response_model=MeResponse)
+def me(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return {
+        "user": current_user,
+        "billing": get_credit_summary(db, current_user.id),
+    }
+
+
+@app.get("/api/billing/summary", response_model=BillingSummaryOut)
+def billing_summary(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return get_credit_summary(db, current_user.id)
+
+
+def parse_bool(value: str) -> bool:
+    return str(value).strip().lower() in {"true", "1", "yes", "on"}
 
 
 def ensure_cloudinary_configured():
@@ -103,7 +207,8 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
 
 
 def render_pdf_pages_to_urls(pdf_bytes: bytes, max_pages: int = 4) -> list[str]:
-    ensure_cloudinary_configured()
+    if not all([cloud_name, cloudinary_api_key, cloudinary_api_secret]):
+        return []
 
     document = fitz.open(stream=pdf_bytes, filetype="pdf")
     page_urls = []
@@ -132,13 +237,21 @@ def extract_syllabus_outline(
     preview_urls: list[str],
     syllabus_text: str,
 ) -> dict:
+    if not preview_urls and not syllabus_text.strip():
+        return {
+            "exam_name_guess": "",
+            "subject_guess": "",
+            "units": [],
+            "all_topics": [],
+        }
+
     content = [
         {
             "type": "text",
             "text": """
 Extract the syllabus details from the given image/PDF content.
 
-Return only valid JSON with this shape:
+Return only valid JSON with this exact shape:
 {
   "exam_name_guess": "",
   "subject_guess": "",
@@ -189,7 +302,15 @@ Return only valid JSON with this shape:
         ],
     )
 
-    return json.loads(response.choices[0].message.content)
+    raw_content = response.choices[0].message.content or "{}"
+    parsed = json.loads(raw_content)
+
+    return {
+        "exam_name_guess": parsed.get("exam_name_guess", ""),
+        "subject_guess": parsed.get("subject_guess", ""),
+        "units": parsed.get("units", []),
+        "all_topics": parsed.get("all_topics", []),
+    }
 
 
 def build_research_queries(
@@ -217,14 +338,10 @@ def build_research_queries(
     ]
 
     if topic_seed:
-        queries.append(
-            f"{base_context} topics {topic_seed} most important units"
-        )
+        queries.append(f"{base_context} topics {topic_seed} most important units")
 
     for topic in extracted_topics[:3]:
-        queries.append(
-            f"{base_context} {topic} important questions weightage"
-        )
+        queries.append(f"{base_context} {topic} important questions weightage")
 
     deduped = []
     seen = set()
@@ -276,9 +393,7 @@ def run_web_research(queries: list[str]) -> dict:
                     )
 
                 snippet = content[:500]
-                chunks.append(
-                    f"Title: {title}\nURL: {url}\nSnippet: {snippet}"
-                )
+                chunks.append(f"Title: {title}\nURL: {url}\nSnippet: {snippet}")
 
         except Exception:
             continue
@@ -308,7 +423,8 @@ def build_planner_prompt(
     return f"""
 You are an expert exam strategist and study planner.
 
-Your job is to create a practical timetable and also give smart guidance based on:
+Your job is to create a practical timetable and also give smart guidance based
+on:
 1. the user's syllabus
 2. exam context
 3. internet research about topic importance, weightage, and repeated patterns
@@ -345,7 +461,8 @@ Rules:
    - Should Do
    - Low Priority if time-constrained
 4. Mention likely high-weightage topics if supported by the evidence.
-5. Mention repeated patterns from previous papers only as guidance, not certainty.
+5. Mention repeated patterns from previous papers only as guidance, not
+   certainty.
 6. Keep the timetable realistic and balanced.
 7. Include revision days.
 8. Return clean Markdown only.
@@ -384,7 +501,11 @@ async def generate_study_plan(
     enable_web_research: str = Form("true"),
     source_url: Optional[str] = Form(None),
     source_file: Optional[UploadFile] = File(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
+    ensure_credit_available(db, current_user.id)
+
     try:
         parsed_start_date = date.fromisoformat(start_date)
         parsed_end_date = date.fromisoformat(end_date)
@@ -414,7 +535,7 @@ async def generate_study_plan(
             detail="Please select at least one study day.",
         )
 
-    web_research_enabled = enable_web_research.lower() == "true"
+    web_research_enabled = parse_bool(enable_web_research)
 
     final_source_url = (source_url or "").strip()
     preview_urls = []
@@ -445,6 +566,15 @@ async def generate_study_plan(
             syllabus_text = extract_text_from_pdf(file_bytes)
             preview_urls = render_pdf_pages_to_urls(file_bytes, max_pages=3)
             preview_url = preview_urls[0] if preview_urls else None
+
+            if not syllabus_text.strip() and not preview_urls:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Could not read the uploaded PDF. "
+                        "Please upload a clearer file."
+                    ),
+                )
 
         else:
             raise HTTPException(
@@ -517,6 +647,7 @@ async def generate_study_plan(
     )
 
     content = [{"type": "text", "text": prompt}]
+
     for url in preview_urls[:3]:
         content.append(
             {
@@ -544,7 +675,37 @@ async def generate_study_plan(
             ],
         )
 
-        schedule = response.choices[0].message.content
+        schedule = response.choices[0].message.content or ""
+
+        planner_usage = response.usage
+        planner_cost_usd = estimate_openai_cost(planner_model, planner_usage)
+
+        source_parse_cost_usd = (
+            pdf_parse_estimate_usd
+            if source_type == "pdf"
+            else vision_parse_estimate_usd
+        )
+
+        research_cost_usd = (
+            web_research_estimate_usd if web_research_enabled else 0.0
+        )
+
+        total_estimated_cost_usd = round(
+            planner_cost_usd + source_parse_cost_usd + research_cost_usd,
+            6,
+        )
+
+        billing = record_usage(
+            db=db,
+            user_id=current_user.id,
+            cost_usd=total_estimated_cost_usd,
+            prompt_tokens=read_usage_field(planner_usage, "prompt_tokens"),
+            completion_tokens=read_usage_field(
+                planner_usage,
+                "completion_tokens",
+            ),
+            search_calls=1 if web_research_enabled else 0,
+        )
 
         return {
             "success": True,
@@ -553,6 +714,7 @@ async def generate_study_plan(
             "schedule_markdown": schedule,
             "research_sources": research_sources,
             "syllabus_outline": syllabus_outline,
+            "billing": billing,
         }
 
     except Exception as exc:

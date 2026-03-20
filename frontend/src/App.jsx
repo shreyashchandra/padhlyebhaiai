@@ -1,26 +1,9 @@
-import { useRef, useState } from "react";
-import axios from "axios";
+import { useEffect, useMemo, useRef, useState } from "react";
 import html2pdf from "html2pdf.js";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import {
-  BookOpen,
-  Brain,
-  CalendarDays,
-  Clock3,
-  Download,
-  FileText,
-  Globe2,
-  GraduationCap,
-  Link2,
-  RefreshCcw,
-  Sparkles,
-  UploadCloud,
-} from "lucide-react";
+import api from "./lib/api";
 import "./App.css";
-
-const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
 const daysOfWeek = [
   "Monday",
@@ -49,6 +32,16 @@ const prepModes = [
 function App() {
   const resultRef = useRef(null);
 
+  const [initialLoading, setInitialLoading] = useState(true);
+
+  const [authMode, setAuthMode] = useState("login");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authLoading, setAuthLoading] = useState(false);
+
+  const [user, setUser] = useState(null);
+  const [billing, setBilling] = useState(null);
+
   const [inputMode, setInputMode] = useState("upload");
   const [sourceUrl, setSourceUrl] = useState("");
   const [sourceFile, setSourceFile] = useState(null);
@@ -74,6 +67,101 @@ function App() {
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
 
+  const isLimited = Boolean(billing?.is_limited);
+
+  const remainingPercentage = useMemo(() => {
+    if (!billing?.limit_usd) return 100;
+
+    return Math.max(
+      0,
+      Math.min(100, (billing.remaining_usd / billing.limit_usd) * 100),
+    );
+  }, [billing]);
+
+  const formatMoney = (value) => {
+    const number = Number(value || 0);
+    return `$${number.toFixed(2)}`;
+  };
+
+  const formatResetAt = (value) => {
+    if (!value) return "next month";
+    const date = new Date(value);
+
+    if (Number.isNaN(date.getTime())) {
+      return value;
+    }
+
+    return date.toLocaleString();
+  };
+
+  const loadMe = async () => {
+    try {
+      const response = await api.get("/api/auth/me");
+      setUser(response.data.user);
+      setBilling(response.data.billing);
+    } catch {
+      localStorage.removeItem("padhlyebhaiai_token");
+      setUser(null);
+      setBilling(null);
+    } finally {
+      setInitialLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    const token = localStorage.getItem("padhlyebhaiai_token");
+
+    if (token) {
+      loadMe();
+    } else {
+      setInitialLoading(false);
+    }
+  }, []);
+
+  const handleAuth = async (event) => {
+    event.preventDefault();
+    setError("");
+
+    if (!authEmail.trim() || !authPassword.trim()) {
+      setError("Please enter email and password.");
+      return;
+    }
+
+    try {
+      setAuthLoading(true);
+
+      const endpoint =
+        authMode === "login" ? "/api/auth/login" : "/api/auth/register";
+
+      const response = await api.post(endpoint, {
+        email: authEmail.trim(),
+        password: authPassword,
+      });
+
+      localStorage.setItem("padhlyebhaiai_token", response.data.access_token);
+
+      setUser(response.data.user);
+      setBilling(response.data.billing);
+      setAuthEmail("");
+      setAuthPassword("");
+      setError("");
+    } catch (err) {
+      setError(
+        err?.response?.data?.detail || "Authentication failed. Try again.",
+      );
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem("padhlyebhaiai_token");
+    setUser(null);
+    setBilling(null);
+    setResult(null);
+    setError("");
+  };
+
   const toggleStudyDay = (day) => {
     setStudyDays((prev) =>
       prev.includes(day) ? prev.filter((item) => item !== day) : [...prev, day],
@@ -82,32 +170,6 @@ function App() {
 
   const handleFileChange = (event) => {
     const file = event.target.files?.[0] || null;
-    if (!file) {
-      setSourceFile(null);
-      return;
-    }
-
-    const validTypes = [
-      "image/png",
-      "image/jpeg",
-      "image/jpg",
-      "image/webp",
-      "application/pdf",
-    ];
-
-    const validExtensions = [".png", ".jpg", ".jpeg", ".webp", ".pdf"];
-    const lowerName = file.name.toLowerCase();
-    const hasValidExtension = validExtensions.some((ext) =>
-      lowerName.endsWith(ext),
-    );
-
-    if (!validTypes.includes(file.type) && !hasValidExtension) {
-      setError("Only PNG, JPG, JPEG, WEBP, and PDF files are supported.");
-      setSourceFile(null);
-      return;
-    }
-
-    setError("");
     setSourceFile(file);
   };
 
@@ -140,7 +202,17 @@ function App() {
     setError("");
     setResult(null);
 
+    if (isLimited) {
+      setError(
+        `Your free limit is utilized for this month. It will reset on ${formatResetAt(
+          billing?.reset_at,
+        )}.`,
+      );
+      return;
+    }
+
     const validationError = validateForm();
+
     if (validationError) {
       setError(validationError);
       return;
@@ -169,23 +241,33 @@ function App() {
         formData.append("source_file", sourceFile);
       }
 
-      const response = await axios.post(
-        `${API_BASE_URL}/api/study-plan`,
-        formData,
-        {
-          headers: {
-            "Content-Type": "multipart/form-data",
-          },
+      const response = await api.post("/api/study-plan", formData, {
+        headers: {
+          "Content-Type": "multipart/form-data",
         },
-      );
+      });
 
       setResult(response.data);
+
+      if (response.data.billing) {
+        setBilling(response.data.billing);
+      } else {
+        await loadMe();
+      }
     } catch (err) {
       const message =
         err?.response?.data?.detail ||
-        err?.message ||
         "Something went wrong while generating the plan.";
+
       setError(message);
+
+      if (err?.response?.status === 401) {
+        handleLogout();
+      }
+
+      if (err?.response?.status === 402) {
+        await loadMe();
+      }
     } finally {
       setLoading(false);
     }
@@ -194,80 +276,248 @@ function App() {
   const handleDownloadPdf = () => {
     if (!resultRef.current) return;
 
-    const options = {
-      margin: [0.35, 0.35, 0.35, 0.35],
-      filename: `padhlyebhaiai-study-plan-${
-        new Date().toISOString().split("T")[0]
-      }.pdf`,
-      image: { type: "jpeg", quality: 0.98 },
-      html2canvas: {
-        scale: 2,
-        useCORS: true,
-        backgroundColor: "#060816",
-      },
-      jsPDF: {
-        unit: "in",
-        format: "a4",
-        orientation: "portrait",
-      },
-      pagebreak: { mode: ["css", "legacy"] },
-    };
-
-    html2pdf().set(options).from(resultRef.current).save();
+    html2pdf()
+      .set({
+        margin: 0.4,
+        filename: `padhlyebhaiai-study-plan-${
+          new Date().toISOString().split("T")[0]
+        }.pdf`,
+        image: { type: "jpeg", quality: 0.98 },
+        html2canvas: {
+          scale: 2,
+          useCORS: true,
+          backgroundColor: "#060816",
+        },
+        jsPDF: {
+          unit: "in",
+          format: "a4",
+          orientation: "portrait",
+        },
+        pagebreak: { mode: ["css", "legacy"] },
+      })
+      .from(resultRef.current)
+      .save();
   };
 
-  const handleReset = () => {
+  const handleResetPlanner = () => {
     setInputMode("upload");
     setSourceUrl("");
     setSourceFile(null);
+
     setStudyTime(2);
     setStartDate("");
     setEndDate("");
     setStudyDays([]);
+
     setMaxSessionLength("1 hour");
     setBreakInterval("5-minute break after 30 minutes of study");
+
     setExamName("");
     setBoardUniversity("");
     setClassSemester("");
     setSubjectName("");
     setPrepMode("last-month");
     setEnableWebResearch(true);
-    setError("");
+
     setResult(null);
+    setError("");
   };
 
   const topicList = result?.syllabus_outline?.all_topics || [];
   const unitList = result?.syllabus_outline?.units || [];
   const sourceList = result?.research_sources || [];
 
+  if (initialLoading) {
+    return (
+      <div className="page">
+        <div className="hero">
+          <div className="hero-content">
+            <h1>PadhLyeBhaiAI</h1>
+            <p>Loading your workspace...</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <div className="page">
+        <div className="hero">
+          <div className="hero-content">
+            <div className="hero-badges">
+              <span className="badge">AI Study Planner</span>
+              <span className="badge">Image + PDF Support</span>
+              <span className="badge">Free Monthly Credit</span>
+            </div>
+
+            <h1>PadhLyeBhaiAI</h1>
+            <p>
+              Upload your syllabus, let AI research the exam, prioritize what
+              matters most, and generate a practical study timetable.
+            </p>
+          </div>
+
+          <div className="hero-glow" />
+        </div>
+
+        <div className="auth-shell">
+          <div className="panel auth-card">
+            <div className="section-header">
+              <h2>Welcome</h2>
+              <p>
+                Sign in or create an account to use your free monthly study-plan
+                credits.
+              </p>
+            </div>
+
+            <div className="mode-switch">
+              <button
+                type="button"
+                className={authMode === "login" ? "mode active" : "mode"}
+                onClick={() => setAuthMode("login")}
+              >
+                Login
+              </button>
+
+              <button
+                type="button"
+                className={authMode === "register" ? "mode active" : "mode"}
+                onClick={() => setAuthMode("register")}
+              >
+                Register
+              </button>
+            </div>
+
+            <form onSubmit={handleAuth} className="form">
+              <div className="field">
+                <label>Email</label>
+                <input
+                  type="email"
+                  placeholder="you@example.com"
+                  value={authEmail}
+                  onChange={(e) => setAuthEmail(e.target.value)}
+                />
+              </div>
+
+              <div className="field">
+                <label>Password</label>
+                <input
+                  type="password"
+                  placeholder="Minimum 8 characters"
+                  value={authPassword}
+                  onChange={(e) => setAuthPassword(e.target.value)}
+                />
+              </div>
+
+              <button
+                type="submit"
+                className="submit-btn"
+                disabled={authLoading}
+              >
+                {authLoading
+                  ? authMode === "login"
+                    ? "Signing in..."
+                    : "Creating account..."
+                  : authMode === "login"
+                    ? "Login"
+                    : "Create Account"}
+              </button>
+            </form>
+
+            {error && <div className="alert error">{error}</div>}
+
+            <div className="info-card">
+              <h3>Free Usage Policy</h3>
+              <p>
+                Every user gets up to{" "}
+                <strong>$2 worth of monthly credit</strong>.
+              </p>
+              <p>
+                After that, generation is disabled for now and the limit resets
+                next month.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="page">
       <div className="hero">
         <div className="hero-content">
           <div className="hero-badges">
-            <span className="badge">
-              <Sparkles size={14} />
-              AI Study Planner
-            </span>
-            <span className="badge">
-              <Globe2 size={14} />
-              Web Research Enabled
-            </span>
-            <span className="badge">
-              <FileText size={14} />
-              Image + PDF Support
-            </span>
+            <span className="badge">Authenticated</span>
+            <span className="badge">Research-Aware Planning</span>
+            <span className="badge">PDF Export</span>
           </div>
 
           <h1>PadhLyeBhaiAI</h1>
           <p>
-            Upload your syllabus, let AI analyze it, research the exam on the
-            internet, prioritize the important topics, and generate a realistic
-            timetable you can actually follow.
+            Build a realistic exam prep plan from your syllabus image or PDF,
+            backed by AI analysis and exam-context research.
           </p>
         </div>
 
         <div className="hero-glow" />
+      </div>
+
+      <div className="account-bar panel">
+        <div className="account-main">
+          <div>
+            <h3>{user.email}</h3>
+            <p>Logged in and ready to academically lock in.</p>
+          </div>
+
+          <button type="button" className="download-btn" onClick={handleLogout}>
+            Logout
+          </button>
+        </div>
+
+        {billing && (
+          <div className="billing-card">
+            <div className="billing-grid">
+              <div className="stat-box">
+                <span>Monthly Limit</span>
+                <strong>{formatMoney(billing.limit_usd)}</strong>
+              </div>
+
+              <div className="stat-box">
+                <span>Used</span>
+                <strong>{formatMoney(billing.spent_usd)}</strong>
+              </div>
+
+              <div className="stat-box">
+                <span>Remaining</span>
+                <strong>{formatMoney(billing.remaining_usd)}</strong>
+              </div>
+
+              <div className="stat-box">
+                <span>Requests</span>
+                <strong>{billing.request_count}</strong>
+              </div>
+            </div>
+
+            <div className="progress-wrap">
+              <div className="progress-track">
+                <div
+                  className="progress-fill"
+                  style={{ width: `${remainingPercentage}%` }}
+                />
+              </div>
+              <small>Resets on {formatResetAt(billing.reset_at)}</small>
+            </div>
+
+            {isLimited && (
+              <div className="alert error">
+                Limit utilized for this month. Payments are disabled right now.
+                Your next month limit will be reset automatically.
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="layout">
@@ -284,7 +534,6 @@ function App() {
                 className={inputMode === "upload" ? "mode active" : "mode"}
                 onClick={() => setInputMode("upload")}
               >
-                <UploadCloud size={16} />
                 Upload File
               </button>
 
@@ -293,7 +542,6 @@ function App() {
                 className={inputMode === "url" ? "mode active" : "mode"}
                 onClick={() => setInputMode("url")}
               >
-                <Link2 size={16} />
                 Image URL
               </button>
             </div>
@@ -301,7 +549,6 @@ function App() {
             {inputMode === "upload" ? (
               <div className="upload-box">
                 <label htmlFor="sourceFile" className="upload-label">
-                  <UploadCloud size={18} />
                   <span>Choose syllabus image or PDF</span>
                   <small>Supported: PNG, JPG, JPEG, WEBP, PDF</small>
                 </label>
@@ -314,18 +561,12 @@ function App() {
                 />
 
                 {sourceFile && (
-                  <div className="file-chip">
-                    <FileText size={15} />
-                    {sourceFile.name}
-                  </div>
+                  <div className="file-chip">{sourceFile.name}</div>
                 )}
               </div>
             ) : (
               <div className="field">
-                <label>
-                  <Link2 size={15} />
-                  Image URL
-                </label>
+                <label>Image URL</label>
                 <input
                   type="text"
                   placeholder="Paste your syllabus image URL"
@@ -337,54 +578,42 @@ function App() {
 
             <div className="section-header">
               <h2>Exam Context</h2>
-              <p>Give context so the AI researches the right exam properly.</p>
+              <p>Help the AI research the right exam and subject.</p>
             </div>
 
             <div className="grid">
               <div className="field">
-                <label>
-                  <GraduationCap size={15} />
-                  Exam Name
-                </label>
+                <label>Exam Name</label>
                 <input
                   type="text"
-                  placeholder="e.g. CBSE Board Exam, GATE, End Semester Exam"
+                  placeholder="e.g. GATE, CBSE Boards, End Sem"
                   value={examName}
                   onChange={(e) => setExamName(e.target.value)}
                 />
               </div>
 
               <div className="field">
-                <label>
-                  <BookOpen size={15} />
-                  Board / University / Course
-                </label>
+                <label>Board / University / Course</label>
                 <input
                   type="text"
-                  placeholder="e.g. CBSE, AKTU, VTU, JNTUH"
+                  placeholder="e.g. AKTU, CBSE, VTU"
                   value={boardUniversity}
                   onChange={(e) => setBoardUniversity(e.target.value)}
                 />
               </div>
 
               <div className="field">
-                <label>
-                  <CalendarDays size={15} />
-                  Class / Semester
-                </label>
+                <label>Class / Semester</label>
                 <input
                   type="text"
-                  placeholder="e.g. Class 12, Semester 4"
+                  placeholder="e.g. Class 12, Sem 4"
                   value={classSemester}
                   onChange={(e) => setClassSemester(e.target.value)}
                 />
               </div>
 
               <div className="field">
-                <label>
-                  <Brain size={15} />
-                  Subject Name
-                </label>
+                <label>Subject Name</label>
                 <input
                   type="text"
                   placeholder="e.g. Operating Systems"
@@ -394,10 +623,7 @@ function App() {
               </div>
 
               <div className="field">
-                <label>
-                  <Sparkles size={15} />
-                  Preparation Mode
-                </label>
+                <label>Preparation Mode</label>
                 <select
                   value={prepMode}
                   onChange={(e) => setPrepMode(e.target.value)}
@@ -411,10 +637,7 @@ function App() {
               </div>
 
               <div className="field">
-                <label>
-                  <Globe2 size={15} />
-                  Enable Web Research
-                </label>
+                <label>Enable Web Research</label>
                 <select
                   value={enableWebResearch ? "true" : "false"}
                   onChange={(e) =>
@@ -434,10 +657,7 @@ function App() {
 
             <div className="grid">
               <div className="field">
-                <label>
-                  <Clock3 size={15} />
-                  Daily Study Time (hours)
-                </label>
+                <label>Daily Study Time (hours)</label>
                 <input
                   type="number"
                   min="1"
@@ -449,10 +669,7 @@ function App() {
               </div>
 
               <div className="field">
-                <label>
-                  <CalendarDays size={15} />
-                  Start Date
-                </label>
+                <label>Start Date</label>
                 <input
                   type="date"
                   value={startDate}
@@ -461,10 +678,7 @@ function App() {
               </div>
 
               <div className="field">
-                <label>
-                  <CalendarDays size={15} />
-                  End Date
-                </label>
+                <label>End Date</label>
                 <input
                   type="date"
                   value={endDate}
@@ -495,7 +709,7 @@ function App() {
 
             <div className="section-header">
               <h2>Session Settings</h2>
-              <p>Because 8 hours straight sounds inspiring and illegal.</p>
+              <p>Make it realistic, not punishment-based productivity.</p>
             </div>
 
             <div className="grid">
@@ -529,7 +743,11 @@ function App() {
             </div>
 
             <div className="action-row">
-              <button type="submit" className="submit-btn" disabled={loading}>
+              <button
+                type="submit"
+                className="submit-btn"
+                disabled={loading || isLimited}
+              >
                 {loading
                   ? "Generating your timetable..."
                   : "Generate Timetable"}
@@ -538,10 +756,9 @@ function App() {
               <button
                 type="button"
                 className="download-btn secondary"
-                onClick={handleReset}
+                onClick={handleResetPlanner}
                 disabled={loading}
               >
-                <RefreshCcw size={16} />
                 Reset
               </button>
             </div>
@@ -554,29 +771,27 @@ function App() {
           <div className="section-header">
             <h2>Your AI Timetable</h2>
             <p>
-              Smart schedule, topic prioritization, and internet-backed exam
-              insights.
+              Exam insights, topic priorities, and a practical day-wise study
+              plan.
             </p>
           </div>
 
           {!result && !loading && (
             <div className="placeholder">
-              <Sparkles size={32} />
               <h3>No timetable yet</h3>
               <p>
-                Upload a syllabus, set your preferences, and let the AI do the
-                academically dramatic part.
+                Upload a syllabus, choose your preferences, and generate your
+                study plan.
               </p>
             </div>
           )}
 
           {loading && (
             <div className="placeholder">
-              <Sparkles size={32} className="spin" />
-              <h3>Cooking your study plan...</h3>
+              <h3>Generating your study plan...</h3>
               <p>
-                Reading syllabus, researching the exam, and trying not to
-                overwork your future self.
+                Reading syllabus, researching the exam, and turning chaos into a
+                timetable.
               </p>
             </div>
           )}
@@ -603,7 +818,6 @@ function App() {
                   className="download-btn"
                   onClick={handleDownloadPdf}
                 >
-                  <Download size={16} />
                   Save as PDF
                 </button>
               </div>
@@ -625,11 +839,28 @@ function App() {
                   />
                 )}
 
+                {result.billing && (
+                  <div className="info-card">
+                    <h3>Updated Credit Usage</h3>
+                    <p>
+                      Used:{" "}
+                      <strong>{formatMoney(result.billing.spent_usd)}</strong> /{" "}
+                      {formatMoney(result.billing.limit_usd)}
+                    </p>
+                    <p>
+                      Remaining:{" "}
+                      <strong>
+                        {formatMoney(result.billing.remaining_usd)}
+                      </strong>
+                    </p>
+                  </div>
+                )}
+
                 {topicList.length > 0 && (
                   <div className="topics-card">
                     <h3>Extracted Topics</h3>
                     <div className="topics-list">
-                      {topicList.slice(0, 20).map((topic, index) => (
+                      {topicList.slice(0, 24).map((topic, index) => (
                         <span key={`${topic}-${index}`} className="topic-pill">
                           {topic}
                         </span>
@@ -642,15 +873,16 @@ function App() {
                   <div className="units-card">
                     <h3>Detected Units</h3>
                     <div className="units-list">
-                      {unitList.slice(0, 8).map((unit, index) => (
+                      {unitList.slice(0, 10).map((unit, index) => (
                         <div
                           key={`${unit.name}-${index}`}
                           className="unit-item"
                         >
                           <strong>{unit.name || `Unit ${index + 1}`}</strong>
+
                           {Array.isArray(unit.topics) &&
                             unit.topics.length > 0 && (
-                              <p>{unit.topics.slice(0, 5).join(", ")}</p>
+                              <p>{unit.topics.slice(0, 6).join(", ")}</p>
                             )}
                         </div>
                       ))}
