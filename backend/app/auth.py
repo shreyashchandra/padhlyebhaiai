@@ -1,4 +1,3 @@
-import os
 from datetime import datetime, timedelta, timezone
 
 import jwt
@@ -8,16 +7,15 @@ from passlib.context import CryptContext
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .config import settings
 from .db import get_db
 from .models import User
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-secret_key = os.getenv("JWT_SECRET", "change-this-super-secret")
+secret_key = settings.jwt_secret
 algorithm = "HS256"
-access_token_expire_hours = int(
-    os.getenv("ACCESS_TOKEN_EXPIRE_HOURS", "720")
-)
+access_token_expire_hours = settings.access_token_expire_hours
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
