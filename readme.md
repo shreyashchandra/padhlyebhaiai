@@ -36,7 +36,7 @@ frontend/src
 
 ## Running locally
 
-**Backend** (Python 3.11+)
+**Backend** (Python 3.11)
 
 ```bash
 cd backend
@@ -66,7 +66,7 @@ cd frontend && npm run lint && npm run build
 
 ## Deploying
 
-- **Backend:** build `backend/Dockerfile`, or run `uvicorn app.main:app --host 0.0.0.0 --port $PORT`. Set `APP_ENV=production`, a strong `JWT_SECRET`, a Postgres `DATABASE_URL`, `OPENAI_API_KEY` and `FRONTEND_URL` (your frontend's origin, for CORS).
+- **Backend:** build `backend/Dockerfile`, or run `uvicorn app.main:app --host 0.0.0.0 --port $PORT`. Use **Python 3.11**: `backend/.python-version` pins it on Render (newer Pythons break the pinned SQLAlchemy/passlib versions). Set `APP_ENV=production`, a strong `JWT_SECRET`, a Postgres `DATABASE_URL`, `OPENAI_API_KEY` and `FRONTEND_URL` (your frontend's origin, for CORS).
 - **Frontend:** `npm run build` and serve `frontend/dist` from any static host (Vercel, Netlify, Render static). Set `VITE_API_BASE_URL` at build time and add an SPA fallback rewrite to `index.html`.
 - **Schema changes:** on startup the backend creates missing tables and adds new nullable columns, so existing databases upgrade in place. For renames or type changes, adopt Alembic.
 - **Scaling note:** rate limiting is in-memory (per process). If you run several instances, back it with Redis.
