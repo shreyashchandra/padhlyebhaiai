@@ -221,3 +221,23 @@ def test_help_is_free_and_limited(auth_client, monkeypatch):
     assert "ONLY job is to explain how to use" in seen["system"] and "JEE Main" in seen["system"]
     assert seen["n"] == 3  # system + 1 valid history msg (system-role injection dropped) + question
     assert c.post("/api/help/ask", data={"question": "x" * 700}).status_code == 400
+
+
+def test_cors_and_errors_keep_cors_headers(client, monkeypatch):
+    from app.main import app
+
+    origin = "http://localhost:5173"
+    pre = client.options("/api/auth/login", headers={"Origin": origin, "Access-Control-Request-Method": "POST"})
+    assert pre.status_code == 200 and pre.headers["access-control-allow-origin"] == origin
+    bad = client.options("/api/auth/login", headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "POST"})
+    assert bad.status_code == 400
+
+    @app.get("/api/_boom_test")
+    def boom():
+        raise RuntimeError("boom")
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(app, raise_server_exceptions=False) as c:
+        r = c.get("/api/_boom_test", headers={"Origin": origin})
+    assert r.status_code == 500 and r.headers.get("access-control-allow-origin") == origin

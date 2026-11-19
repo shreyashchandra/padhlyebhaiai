@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 
@@ -19,6 +20,7 @@ logger = logging.getLogger("padhlyebhai")
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     sync_schema()
+    logger.info("CORS allowed origins: %s%s", settings.cors_origins, f" + regex {settings.cors_origin_regex}" if settings.cors_origin_regex else "")
     if not settings.openai_api_key:
         logger.warning("OPENAI_API_KEY is not set - AI features will return 503 until it is configured.")
     yield
@@ -32,18 +34,51 @@ app = FastAPI(
     redoc_url=None,
 )
 
+# Starlette runs the LAST-added middleware first. Order, outermost -> innermost:
+#   log_requests -> CORS -> GZip -> catch_errors -> routes
+# catch_errors sits inside CORS so even 500 responses carry CORS headers; otherwise
+# the browser reports a misleading "CORS error" that hides the real failure.
+
+
+@app.middleware("http")
+async def catch_errors(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception:
+        logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+        return JSONResponse(status_code=500, content={"detail": "Something went wrong on our side. Please try again."})
+
+
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
+    allow_origin_regex=settings.cors_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+_cors_pattern = re.compile(settings.cors_origin_regex) if settings.cors_origin_regex else None
+_warned_origins: set[str] = set()
+
+
+def _origin_allowed(origin: str) -> bool:
+    return origin in settings.cors_origins or bool(_cors_pattern and _cors_pattern.fullmatch(origin))
 
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
+    origin = request.headers.get("origin")
+    if origin and not _origin_allowed(origin) and origin not in _warned_origins:
+        _warned_origins.add(origin)
+        logger.warning(
+            "CORS: blocked requests from origin %s. Allowed: %s%s. "
+            "Add it to FRONTEND_URL (comma-separated) if it is your frontend.",
+            origin,
+            ", ".join(settings.cors_origins) or "(none)",
+            f" + regex {settings.cors_origin_regex}" if settings.cors_origin_regex else "",
+        )
     started = time.perf_counter()
     response = await call_next(request)
     if request.url.path.startswith("/api"):
@@ -57,12 +92,6 @@ async def log_requests(request: Request, call_next):
     return response
 
 
-@app.exception_handler(Exception)
-async def unhandled_error(request: Request, exc: Exception):
-    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
-    return JSONResponse(status_code=500, content={"detail": "Something went wrong on our side. Please try again."})
-
-
 @app.get("/api/health")
 def health_check():
     return {
@@ -70,6 +99,9 @@ def health_check():
         "ai_configured": bool(settings.openai_api_key),
         "web_research": research_available(),
         "youtube": bool(settings.youtube_api_key),
+        # Public by nature (browsers send Origin on every request); shown to make CORS setup easy to verify.
+        "cors_allowed_origins": settings.cors_origins,
+        "cors_origin_regex": settings.cors_origin_regex,
     }
 
 

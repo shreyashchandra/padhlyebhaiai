@@ -12,6 +12,15 @@ def _bool(name: str, default: bool = False) -> bool:
     return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _origin(value: str) -> str:
+    """Normalise a FRONTEND_URL entry to a bare origin: strip spaces, quotes, paths and trailing slashes."""
+    value = value.strip().strip("'\"").strip()
+    if "://" in value:
+        scheme, rest = value.split("://", 1)
+        value = f"{scheme.lower()}://{rest.split('/', 1)[0].lower()}"
+    return value.rstrip("/")
+
+
 class Settings:
     def __init__(self) -> None:
         self.env = os.getenv("APP_ENV", "development")
@@ -33,7 +42,9 @@ class Settings:
         self.youtube_daily_search_limit = int(os.getenv("YOUTUBE_DAILY_SEARCH_LIMIT", "90"))
 
         origins = os.getenv("FRONTEND_URL", "http://localhost:5173")
-        self.cors_origins = [o.strip().rstrip("/") for o in origins.split(",") if o.strip()]
+        self.cors_origins = [o for o in (_origin(x) for x in origins.split(",")) if o]
+        # Optional, e.g. https://padhlyebhai(-[a-z0-9-]+)?\.vercel\.app to allow Vercel preview URLs.
+        self.cors_origin_regex = os.getenv("FRONTEND_URL_REGEX", "").strip() or None
 
         self.max_upload_mb = int(os.getenv("MAX_UPLOAD_MB", "15"))
         self.ai_rate_limit_per_minute = int(os.getenv("AI_RATE_LIMIT_PER_MINUTE", "20"))
